@@ -3,138 +3,146 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"time"
 
-	"github.com/gocolly/colly/v2"
+	"github.com/PuerkitoBio/goquery"
+	"github.com/gocolly/colly"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type PageData struct {
-	URL         string `bson:"url" json:"url"`
-	Title       string `bson:"title" json:"title"`
-	Description string `bson:"description" json:"description"`
+	URL         string    `bson:"url" json:"url"`
+	Title       string    `bson:"title" json:"title"`
+	Description string    `bson:"description" json:"description"`
+	Images      []string  `bson:"images" json:"images"`
+	Links       []string  `bson:"links" json:"links"`
+	Timestamp   time.Time `bson:"timestamp" json:"timestamp"`
 }
 
 func main() {
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	mongoURI := "mongodb://localhost:27017"
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	// MongoDB connection setup
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://localhost:27017"))
 	if err != nil {
-		log.Fatalf("MongoDB connect error: %v", err)
+		log.Fatal("MongoDB connection failed:", err)
 	}
+	defer client.Disconnect(context.TODO())
 
-	defer func() {
-		_ = client.Disconnect(context.Background())
-	}()
+	collection := client.Database("crawlerDB").Collection("pages")
 
-	db := client.Database("webcrawler")
-	collection := db.Collection("pages_data")
-
-	indexModel := mongo.IndexModel{
-		Keys:    bson.D{{Key: "url", Value: 1}},
-		Options: options.Index().SetUnique(true).SetBackground(true),
-	}
-	if _, err := collection.Indexes().CreateOne(context.Background(), indexModel); err != nil {
-		log.Fatalf("Failed creating index: %v", err)
-	}
-
-	var results []PageData
-
+	// Colly setup
 	c := colly.NewCollector(
-		colly.AllowedDomains("blinkeet-rho.vercel.app", "www.blinkeet-rho.vercel.app"),
+		colly.AllowedDomains("blinkeet-rho.vercel.app"),
 		colly.MaxDepth(2),
+		colly.Async(true),
+		colly.CacheDir("./cache"),
 	)
-	c.Async = true
 
-	if err := c.Limit(&colly.LimitRule{
+	// Set rate limit (avoid bans)
+	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: 4,
-		RandomDelay: 1 * time.Second,
-	}); err != nil {
-		log.Fatalf("Failed to set limit: %v", err)
-	}
+		RandomDelay: 2 * time.Second,
+	})
 
+	// Regex to skip unwanted URLs
+	skipPattern := regexp.MustCompile(`(login|signup|cart|logout)`)
+
+	// Handler for main content (extract data)
 	c.OnHTML("head", func(e *colly.HTMLElement) {
 		page := PageData{
-			URL: e.Request.URL.String(),
+			URL:       e.Request.URL.String(),
+			Timestamp: time.Now(),
 		}
+
 		page.Title = e.DOM.Find("title").Text()
 		page.Description, _ = e.DOM.Find(`meta[name="description"]`).Attr("content")
 
-		results = append(results, page)
-
-		// Insert into MongoDB — duplicates handled by unique index
-		_, err := collection.InsertOne(context.Background(), page)
-		if err != nil {
-
-			// If duplicate key (URL already present), ignore; otherwise log
-			var writeEx mongo.WriteException
-			if errors.As(err, &writeEx) {
-
-				duplicate := false
-				for _, we := range writeEx.WriteErrors {
-					if we.Code == 11000 {
-						duplicate = true
-						break
-					}
-				}
-				if duplicate {
-					fmt.Println("Duplicate (skipped):", page.URL)
-					return
-				}
+		e.DOM.Find("img").Each(func(_ int, img *goquery.Selection) {
+			src, _ := img.Attr("src")
+			if src != "" {
+				page.Images = append(page.Images, e.Request.AbsoluteURL(src))
 			}
+		})
 
-			log.Printf("Mongo insert error for %s: %v\n", page.URL, err)
-			return
+		e.DOM.Find("a[href]").Each(func(_ int, link *goquery.Selection) {
+			href, _ := link.Attr("href")
+			absURL := e.Request.AbsoluteURL(href)
+			if absURL != "" && !skipPattern.MatchString(absURL) {
+				page.Links = append(page.Links, absURL)
+			}
+		})
+
+		// Save to MongoDB (Upsert to prevent duplicates)
+		_, err := collection.UpdateOne(
+			context.TODO(),
+			bson.M{"url": page.URL},
+			bson.M{"$set": page},
+			options.Update().SetUpsert(true),
+		)
+		if err != nil {
+			log.Println("Error saving to MongoDB:", err)
+		} else {
+			fmt.Println("✅ Saved:", page.URL)
 		}
-		fmt.Println("Inserted:", page.URL)
 	})
 
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		link := e.Request.AbsoluteURL(e.Attr("href"))
-		if link == "" {
-			return
+		if link != "" && !skipPattern.MatchString(link) {
+			c.Visit(link)
 		}
-
-		c.Visit(link)
 	})
 
 	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting:", r.URL.String())
+		fmt.Println("🔗 Visiting:", r.URL.String())
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("Request URL: %s failed: %v (status: %d)\n", r.Request.URL, err, r.StatusCode)
+		log.Printf("Error on %s: %v", r.Request.URL, err)
 	})
 
 	startURL := "https://blinkeet-rho.vercel.app"
-	fmt.Println("Starting crawl on:", startURL)
+	fmt.Println("🚀 Starting crawl on:", startURL)
 	if err := c.Visit(startURL); err != nil {
-		log.Fatalf("Visit error: %v", err)
+		log.Fatal("Visit error:", err)
 	}
 
 	c.Wait()
+	fmt.Println("\n Crawl complete! All data stored in MongoDB.")
+
+	exportToJSON(collection)
+}
+
+func exportToJSON(collection *mongo.Collection) {
+	cursor, err := collection.Find(context.TODO(), bson.M{})
+	if err != nil {
+		log.Println("Error fetching from MongoDB:", err)
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var pages []PageData
+	if err = cursor.All(context.TODO(), &pages); err != nil {
+		log.Println("Cursor decode error:", err)
+		return
+	}
 
 	file, err := os.Create("results.json")
 	if err != nil {
-		log.Fatalf("Could not create results.json: %v", err)
+		log.Println("Error creating JSON file:", err)
+		return
 	}
 	defer file.Close()
 
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(results); err != nil {
-		log.Fatalf("Error writing JSON: %v", err)
-	}
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	_ = encoder.Encode(pages)
 
-	fmt.Println("Crawl finished. results.json written and data stored in MongoDB (webcrawler.pages_data).")
+	fmt.Println("💾 Exported backup to results.json")
 }

@@ -1,7 +1,10 @@
 [
   {
-    "url": "https://blinkeet-rho.vercel.app/",
+    "url": "https://blinkeet-rho.vercel.app",
     "title": "Blinkeet",
-    "description": ""
+    "description": "",
+    "images": null,
+    "links": null,
+    "timestamp": "2025-11-09T15:01:28.117Z"
   }
 ]
