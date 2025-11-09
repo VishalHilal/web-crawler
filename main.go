@@ -37,7 +37,8 @@ func main() {
 
 	// Colly setup
 	c := colly.NewCollector(
-		colly.AllowedDomains("blinkeet-rho.vercel.app"),
+		colly.AllowedDomains("blinkeet-rho.vercel.app", "golang.org", "go.dev"),
+
 		colly.MaxDepth(2),
 		colly.Async(true),
 		colly.CacheDir("./cache"),
@@ -107,7 +108,7 @@ func main() {
 		log.Printf("Error on %s: %v", r.Request.URL, err)
 	})
 
-	startURL := "https://blinkeet-rho.vercel.app"
+	startURL := "https://golang.org"
 	fmt.Println("🚀 Starting crawl on:", startURL)
 	if err := c.Visit(startURL); err != nil {
 		log.Fatal("Visit error:", err)
@@ -144,5 +145,5 @@ func exportToJSON(collection *mongo.Collection) {
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(pages)
 
-	fmt.Println("💾 Exported backup to results.json")
+	fmt.Println("Exported backup to results.json")
 }
